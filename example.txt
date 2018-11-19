@@ -1,0 +1,113 @@
+@method_decorator(staff_member_required, name='dispatch')
+class UploadTableView(TemplateView):
+    template_name = 'page/table_uploader.html'
+
+    def get_null_field(self):
+        # Пустое значение
+        return '---'
+
+    def get_field_list(self):
+        field_list = [Item._meta.get_field('id'),
+                      Item._meta.get_field('name'),
+                      Item._meta.get_field('description'),
+                      Item._meta.get_field('net_weight')]
+        return field_list
+
+    def first_row_has_float(self, keys):
+        for k in keys:
+            if type(k) == float:
+                return True
+        return False
+
+    def parse_file(self, file, field_names=None):
+        column_values_list = []
+        document_values_list = []
+
+        file_name = file.name
+        if file_name.endswith('.csv'):
+            reader = csv.reader(TextIOWrapper(file, errors='replace'), delimiter=';')
+            for row in reader:
+                for cell in row:
+                    column_values_list.append(cell)
+                document_values_list.append(column_values_list)
+                column_values_list = []
+            keys = [x for xs in document_values_list[0] for x in xs.split(',')]
+            if field_names is False:
+                keys = [1 + keys.index(k) for k in keys]
+            values = []
+            for values_list in document_values_list[1:]:
+                values.append([x for xs in values_list for x in xs.split(',')])
+            result_dict = {x: list(y) for x, y in zip(keys, zip(*values))}
+            return result_dict
+        elif file_name.endswith('.xlsx'):
+            wb = load_workbook(filename=BytesIO(file.read()))
+            ws = wb.active
+            max_row = ws.max_row
+            max_column = ws.max_column
+            for j in range(1, max_column + 1):
+                for i in range(1, max_row + 1):
+                    cell_obj = ws.cell(row=i, column=j)
+                    column_values_list.append(cell_obj.value)
+                if field_names is False:
+                    column_values_list.insert(0, ws.cell(row=1, column=j).column)
+                document_values_list.append(column_values_list)
+                column_values_list = []
+            result_dict = {values[0]: values[1:] for values in document_values_list}
+            return result_dict
+
+    def post(self, request):
+        # Первая форма (с файлом)
+        if request.FILES.get('file', None):
+            parsers = Company.objects.exclude(parser_type='').values_list('parser_type', flat=True)
+            with_field_names = request.POST.get('has_title', None)
+            field_list = self.get_field_list()
+            result_dict = self.parse_file(request.FILES['file'], True if with_field_names else False)
+            keys = list(result_dict.keys())
+            if self.first_row_has_float(keys) is True:
+                warning = 'Первая строка не является заголовками'
+                return render(request, 'table_uploader.html', {
+                    'warning': warning,
+                })
+            return render(request, 'table_uploader.html', {
+                'keys': keys,
+                'field_list': field_list,
+                'result_dict': result_dict,
+                'with_field_names': with_field_names,
+                'parsers': parsers,
+                'null_field': self.get_null_field,
+            })
+        # Вторая форма
+        if request.POST['fields']:
+            dict_with_fields = {}
+            dict_from_form = ast.literal_eval(request.POST.get('dict', ''))
+            fields = request.POST.getlist('fields', '')
+            parser_type = request.POST.get('parser-type', None)
+
+            # Ключи словаря меняются на настоящие названия полей в бд
+            i = 0
+            for field in fields:
+                if not field == self.get_null_field():
+                    dict_with_fields.update({field: list(dict_from_form.values())[i]})
+                i += 1
+            # Создание отдельного словаря для каждого товара
+            for i in range(0, len(list(dict_with_fields.values())[0])):
+                existing_object = Item.objects.filter(article_from_site=dict_with_fields['id'][i]).values('id', 'name',
+                                                                                                           'description')
+                item_list_dict = {}
+                for k in dict_with_fields.keys():
+                    item_dict = dict([(k, dict_with_fields[k][i])])
+                    item_dict.update({'slug': slugify(dict_with_fields['name'][i])})
+                    if len(existing_object) == 0:
+                        item_list_dict.update(item_dict)
+                    else:
+                        if not existing_object[0][k]:
+                            item_list_dict.update(item_dict)
+                if 'id' in item_list_dict:
+                    item_list_dict.pop('id')
+
+                final_dict.update(item_list_dict)
+                Item.objects.update_or_create(article_from_site=dict_with_fields['id'][i], parser_type=parser_type,
+                                                     defaults=final_dict)
+            return render(request, 'table_uploader.html', {
+                'uploaded': 'Загружено',
+            })
